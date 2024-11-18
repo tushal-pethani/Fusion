@@ -5,7 +5,7 @@ from django.shortcuts import get_object_or_404, redirect, render
 
 from rest_framework import status,permissions
 from django.contrib.auth.models import User
-from django.http import JsonResponse
+from django.http import JsonResponse,HttpResponse
 from django.core.files.storage import FileSystemStorage
 from django.views.decorators.csrf import csrf_exempt
 from ..models import *
@@ -13,11 +13,23 @@ from applications.academic_information.models import Student
 from .serializers import PlacementScheduleSerializer, NotifyStudentSerializer
 import json
 
+from rest_framework.decorators import api_view,permission_classes
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.authentication import TokenAuthentication
+from django.utils.decorators import method_decorator
+from applications.globals.models import ExtraInfo
+from applications.academic_information.api.serializers import StudentSerializers
+import datetime
+import io
+from reportlab.pdfgen import canvas
+from django.views.decorators.csrf import csrf_exempt
 
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from rest_framework import permissions
-from django.http import JsonResponse
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,ListFlowable,ListItem
+from reportlab.lib import colors
+from reportlab.lib.units import inch
+from reportlab.graphics.shapes import Line,Drawing
 
 class PlacementScheduleView(APIView):
     permission_classes = [permissions.AllowAny]
@@ -202,6 +214,149 @@ class BatchStatisticsView(APIView):
 
     
 
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+@csrf_exempt
+def generate_cv(request):
+    fields = request.data
+    user = request.user
+
+    if not user.is_authenticated:
+        return Response({"error": "User not authenticated"}, status=401)
+
+    profile = get_object_or_404(Student, id__user=user)
+
+    # Initialize PDF
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=letter,
+        topMargin=20,
+        leftMargin=30,  # Reduced left margin
+        rightMargin=30,  # Reduced right margin
+    )
+
+    # Styles
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        name="Title",
+        parent=styles["Title"],
+        fontSize=18,
+        leading=22,
+        spaceAfter=10,
+        alignment=1,  # Center alignment
+    )
+    section_header_style = ParagraphStyle(
+        name="SectionHeader",
+        parent=styles["Heading2"],
+        fontSize=14,
+        leading=18,
+        spaceAfter=4,  # Reduce space after section header
+        textColor=colors.HexColor("#c43119"),  # Custom color
+    )
+    body_style = styles["BodyText"]
+    body_style.fontSize = 11
+    body_style.leading = 14
+
+    # Helper to format dates
+    def format_date(date):
+        return date.strftime("%d %B %Y") if date else "Ongoing"
+
+    # Content container
+    content = []
+
+    # Add dynamic sections with optional bullet points
+    def add_section(title, queryset, formatter, bullet_points=False):
+        content.append(Paragraph(title, section_header_style))
+        # Add a horizontal line under the section header
+        line = Line(0, 0, 500, 0, strokeColor=colors.HexColor("#c43119"))  # Adjust line length
+        drawing = Drawing(500, 1)  # Adjust drawing width
+        drawing.add(line)
+        content.append(drawing)
+        content.append(Spacer(1, 4))  # Reduce space between header and content
+
+        if bullet_points:
+            # Add items as a bulleted list
+            items = [Paragraph(formatter(obj), body_style) for obj in queryset]
+            content.append(ListFlowable(
+                [ListItem(i) for i in items],
+                bulletType="bullet",  # Use bullets
+                start="circle",  # Specify bullet style
+                leftIndent=10,  # Indent for bullets
+                bulletFontSize=8,  # Decrease bullet size
+                bulletOffset=10,  # Increase space between bullet and text
+            ))
+        else:
+            # Add items normally
+            for obj in queryset:
+                content.append(Paragraph(formatter(obj), body_style))
+        content.append(Spacer(1, 8))  # Reduce space between sections
+
+    # Title
+    content.append(Paragraph(f"{user.get_full_name()}", title_style))
+    content.append(Spacer(1, 8))  # Reduce space after title
+
+    # Dynamic Sections
+    if fields.get("achievements", False):
+        achievements = Achievement.objects.filter(unique_id=profile)
+        add_section(
+            "Achievements",
+            achievements,
+            lambda a: f"{a.achievement} ({a.achievement_type}) - {a.issuer} ({format_date(a.date_earned)})",
+            bullet_points=True,
+        )
+
+    if fields.get("education", False):
+        education = Education.objects.filter(unique_id=profile)
+        add_section(
+            "Education",
+            education,
+            lambda e: f"{e.degree} in {e.stream or 'General'} from {e.institute}, Grade: {e.grade} ({format_date(e.sdate)} - {format_date(e.edate)})"
+        )
+
+    if fields.get("skills", False):
+        skills = Has.objects.filter(unique_id=profile)
+        add_section(
+            "Skills",
+            skills,
+            lambda s: f"{s.skill_id.skill} (Rating: {s.skill_rating}%)",
+            bullet_points=True,
+        )
+
+    if fields.get("experience", False):
+        experience = Experience.objects.filter(unique_id=profile)
+        add_section(
+            "Experience",
+            experience,
+            lambda e: f"<b>{e.title}</b> at {e.company} ({format_date(e.sdate)} - {format_date(e.edate)})<br/>{e.description or 'No description'}"
+        )
+
+    if fields.get("projects", False):
+        projects = Project.objects.filter(unique_id=profile)
+        add_section(
+            "Projects",
+            projects,
+            lambda p: f"<b>{p.project_name}</b><br/>{p.summary or 'No description'} (Status: {p.project_status})",
+            bullet_points=True,
+        )
+
+    if fields.get("courses", False):
+        courses = Course.objects.filter(unique_id=profile)
+        add_section(
+            "Courses",
+            courses,
+            lambda c: f"{c.course_name} - {c.description or 'No description'} (License: {c.license_no or 'N/A'})",
+            bullet_points=True,
+        )
+
+    # Build the PDF
+    doc.build(content)
+    buffer.seek(0)
+
+    # Response
+    response = HttpResponse(buffer.getvalue(), content_type="application/pdf")
+    response['Content-Disposition'] = 'attachment; filename="resume.pdf"'
+    return response
 
 
 
